@@ -16,7 +16,6 @@ except ImportError:
     pass
 
 import aiosqlite
-from aiohttp import ClientSession, web
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup, NavigableString
 from deep_translator import GoogleTranslator
@@ -988,8 +987,7 @@ async def adm_channel_add(m: Message, state: FSMContext, bot: Bot):
     await db.run("INSERT OR REPLACE INTO channels VALUES(?,?,?)", (chat.id, chat.title or str(chat.id), link))
     SUB_OK.clear(); await state.clear()
     await m.answer(f"✅ تمت إضافة <b>{html.escape(chat.title or '')}</b> كقناة اشتراك إجباري.")
-    text, mk = await channels_view()
-    await m.answer(text, reply_markup=mk)
+    await m.answer(*await channels_view()) if False else await m.answer((await channels_view())[0], reply_markup=(await channels_view())[1])
 
 
 # إعدادات
@@ -1059,27 +1057,6 @@ async def cleanup_loop():
             if not p.exists(): PENDING.pop(uid, None)
 
 
-async def start_web():
-    """منفذ صغير لخطة Render المجانية (Web Service) + ping ذاتي حتى لا تنام الخدمة."""
-    port = os.getenv("PORT")
-    if not port: return
-    app = web.Application()
-    app.router.add_get("/", lambda r: web.Response(text="OK"))
-    runner = web.AppRunner(app); await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
-    log.info("Web server on port %s", port)
-
-
-async def keep_alive():
-    url = os.getenv("RENDER_EXTERNAL_URL")
-    if not url: return
-    async with ClientSession() as s:
-        while True:
-            await asyncio.sleep(480)
-            try: await s.get(url, timeout=20)
-            except Exception: pass
-
-
 async def main():
     global BOT_USERNAME, BOT_ID
     if not BOT_TOKEN: raise SystemExit("ضع BOT_TOKEN في ملف .env")
@@ -1099,8 +1076,6 @@ async def main():
                                BotCommand(command="me", description="حسابي"), BotCommand(command="redeem", description="تفعيل كود"),
                                BotCommand(command="help", description="المساعدة")])
     asyncio.create_task(cleanup_loop())
-    await start_web()
-    asyncio.create_task(keep_alive())
     log.info("Bot @%s started", BOT_USERNAME)
     while True:
         try:
