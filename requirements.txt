@@ -1,0 +1,8 @@
+aiogram>=3.13
+aiosqlite
+deep-translator
+python-docx
+ebooklib
+beautifulsoup4
+PyMuPDF
+python-dotenv
