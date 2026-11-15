@@ -16,6 +16,7 @@ except ImportError:
     pass
 
 import aiosqlite
+from aiohttp import ClientSession, web
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup, NavigableString
 from deep_translator import GoogleTranslator
@@ -1058,6 +1059,27 @@ async def cleanup_loop():
             if not p.exists(): PENDING.pop(uid, None)
 
 
+async def start_web():
+    """منفذ صغير لخطة Render المجانية (Web Service) + ping ذاتي حتى لا تنام الخدمة."""
+    port = os.getenv("PORT")
+    if not port: return
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    log.info("Web server on port %s", port)
+
+
+async def keep_alive():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url: return
+    async with ClientSession() as s:
+        while True:
+            await asyncio.sleep(480)
+            try: await s.get(url, timeout=20)
+            except Exception: pass
+
+
 async def main():
     global BOT_USERNAME, BOT_ID
     if not BOT_TOKEN: raise SystemExit("ضع BOT_TOKEN في ملف .env")
@@ -1077,6 +1099,8 @@ async def main():
                                BotCommand(command="me", description="حسابي"), BotCommand(command="redeem", description="تفعيل كود"),
                                BotCommand(command="help", description="المساعدة")])
     asyncio.create_task(cleanup_loop())
+    await start_web()
+    asyncio.create_task(keep_alive())
     log.info("Bot @%s started", BOT_USERNAME)
     while True:
         try:
