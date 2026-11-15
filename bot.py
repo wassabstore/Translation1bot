@@ -39,7 +39,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ══════════════════════════ الإعدادات ══════════════════════════
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMINS = {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))}
+ADMINS = {8233150959}
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 TMP = Path(os.getenv("TMP_DIR", "tmp")); TMP.mkdir(exist_ok=True)
 MAX_JOBS = int(os.getenv("MAX_JOBS", "3"))          # كتب تُترجم بالتوازي
