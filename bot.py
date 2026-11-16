@@ -856,6 +856,7 @@ async def fallback(m: Message):
 # ─────────── الإدارة ───────────
 def admin_kb():
     return kb([[("📊 الإحصائيات", "adm:stats"), ("📢 إذاعة", "adm:bc")],
+               [("📋 قائمة المستخدمين", "adm:ul:all:0")],
                [("👤 إدارة مستخدم", "adm:user"), ("📌 الاشتراك الإجباري", "adm:ch")],
                [("🎟 أكواد الاشتراك", "adm:codes"), ("⚙️ الإعدادات", "adm:set")],
                [("🗂 نسخة احتياطية", "adm:backup")]])
@@ -919,12 +920,45 @@ async def settings_view():
     return "⚙️ <b>الإعدادات</b> — اضغط لتعديل قيمة:", kb(rows)
 
 
+# قائمة المستخدمين (صفحات + فلاتر)
+UL_PER = 8
+UL_FILTERS = {"all": "الكل", "prem": "💎 المشتركون", "free": "🆓 المجانيون", "ban": "🚫 المحظورون"}
+
+
+async def users_view(flt, page):
+    now = int(time.time())
+    cond = {"all": "1", "prem": f"premium_until>{now}", "free": f"premium_until<={now} AND banned=0",
+            "ban": "banned=1"}.get(flt, "1")
+    if flt not in UL_FILTERS: flt = "all"
+    total = (await db.one(f"SELECT COUNT(*) c FROM users WHERE {cond}"))["c"]
+    pages = max(1, -(-total // UL_PER))
+    page = min(max(page, 0), pages - 1)
+    rows = await db.all(f"SELECT id,name,username,banned,premium_until FROM users WHERE {cond} "
+                        f"ORDER BY joined DESC LIMIT {UL_PER} OFFSET {page * UL_PER}")
+    btns = []
+    for r in rows:
+        icon = "🚫" if r["banned"] else ("💎" if r["premium_until"] > now else "👤")
+        label = f"{icon} {(r['name'] or '-')[:18]}" + (f" @{r['username']}" if r["username"] else f" {r['id']}")
+        btns.append([(label, f"u:view:{r['id']}")])
+    nav = []
+    if page > 0: nav.append(("⬅️", f"adm:ul:{flt}:{page - 1}"))
+    nav.append((f"{page + 1}/{pages}", f"adm:ul:{flt}:{page}"))
+    if page < pages - 1: nav.append(("➡️", f"adm:ul:{flt}:{page + 1}"))
+    items = list(UL_FILTERS.items())
+    filt = [[(("• " if k == flt else "") + v, f"adm:ul:{k}:0") for k, v in items[:2]],
+            [(("• " if k == flt else "") + v, f"adm:ul:{k}:0") for k, v in items[2:]]]
+    text = f"📋 <b>المستخدمون</b> — {UL_FILTERS[flt]}: <b>{total:,}</b>\nاضغط على مستخدم لإدارته:"
+    return text, kb(filt + btns + [nav, [("🔙 رجوع", "adm:home")]])
+
+
 @adm.callback_query(F.data.startswith("adm:"))
 async def adm_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
     p = cb.data.split(":"); a = p[1]
     await state.clear(); await cb.answer()
     if a == "home": await edit(cb, ADMIN_HOME, admin_kb())
     elif a == "stats": await edit(cb, await stats_text(), kb([[("🔄 تحديث", "adm:stats")], [("🔙 رجوع", "adm:home")]]))
+    elif a == "ul":
+        await edit(cb, *await users_view(p[2], int(p[3])))
     elif a == "bc":
         await state.set_state(AS.bc)
         await edit(cb, "📢 أرسل الآن الرسالة التي تريد إذاعتها (نص / صورة / فيديو / ملف ...)\nللإلغاء: /cancel", BACK)
@@ -977,8 +1011,9 @@ async def user_card(uid):
             f"📊 المتبقي اليوم: {remaining(u):,}\n📅 انضم: {fmt_date(u['joined'])}")
     rows = [[("✅ فك الحظر", f"u:unban:{uid}") if u["banned"] else ("🚫 حظر", f"u:ban:{uid}")],
             [("🎁 +30 يوم", f"u:gift:{uid}:30"), ("🎁 +365 يوم", f"u:gift:{uid}:365")],
-            [("❌ إلغاء الاشتراك", f"u:rm:{uid}"), ("♻️ تصفير الاستهلاك", f"u:reset:{uid}")],
-            [("🔙 رجوع", "adm:home")]]
+            [("♻️ تصفير الاستهلاك", f"u:reset:{uid}")],
+            [("🔙 قائمة المستخدمين", "adm:ul:all:0")]]
+    if is_premium(u): rows.insert(2, [("❌ إلغاء الاشتراك المميز", f"u:rm:{uid}")])
     return text, kb(rows)
 
 
@@ -995,7 +1030,8 @@ async def adm_user_lookup(m: Message, state: FSMContext):
 async def adm_user_action(cb: CallbackQuery, bot: Bot):
     p = cb.data.split(":"); a, uid = p[1], int(p[2])
     if a == "ban" and uid in ADMINS: return await cb.answer("لا يمكن حظر مدير", show_alert=True)
-    if a == "ban": await db.run("UPDATE users SET banned=1 WHERE id=?", (uid,))
+    if a == "view": pass
+    elif a == "ban": await db.run("UPDATE users SET banned=1 WHERE id=?", (uid,))
     elif a == "unban": await db.run("UPDATE users SET banned=0 WHERE id=?", (uid,))
     elif a == "gift":
         until = await add_premium(uid, int(p[3]))
@@ -1004,8 +1040,10 @@ async def adm_user_action(cb: CallbackQuery, bot: Bot):
         asyncio.create_task(resume_pending(bot, uid))
     elif a == "rm": await db.run("UPDATE users SET premium_until=0 WHERE id=?", (uid,))
     elif a == "reset": await db.run("UPDATE users SET used_today=0 WHERE id=?", (uid,))
-    await cb.answer("✅ تم")
-    text, mk = await user_card(uid); await edit(cb, text, mk)
+    await cb.answer() if a == "view" else await cb.answer("✅ تم")
+    text, mk = await user_card(uid)
+    if not text: return await edit(cb, "❌ مستخدم غير موجود.", kb([[("🔙 قائمة المستخدمين", "adm:ul:all:0")]]))
+    await edit(cb, text, mk)
 
 
 # قنوات
