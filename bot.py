@@ -43,7 +43,7 @@ ADMINS = {8233150959} | {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 TMP = Path(os.getenv("TMP_DIR", "tmp")); TMP.mkdir(exist_ok=True)
 MAX_JOBS = int(os.getenv("MAX_JOBS", "3"))          # كتب تُترجم بالتوازي
-WORKERS = int(os.getenv("TRANSLATE_WORKERS", "10"))  # طلبات ترجمة متوازية
+WORKERS = int(os.getenv("TRANSLATE_WORKERS", "4"))  # طلبات ترجمة متوازية
 DEFAULTS = {
     "daily_limit": "30000",     # حرف مجاني يومياً
     "price_month": "150",       # نجوم تيليجرام
@@ -185,18 +185,18 @@ def _gtx(text, lang):
 
 
 def _call(text, lang):
-    for a in range(3):
+    for a in range(4):
+        try:
+            r = _gtx(text, lang)
+            if r: return r
+        except Exception as e:
+            log.warning("gtx failed (try %s): %s", a, e)
         try:
             r = GoogleTranslator(source="auto", target=lang).translate(text)
             if r: return r
         except Exception as e:
             log.warning("deep-translator failed (try %s): %s", a, e)
-        try:
-            r = _gtx(text, lang)
-            if r: return r
-        except Exception as e:
-            log.warning("gtx fallback failed (try %s): %s", a, e)
-        time.sleep(1.2 * (a + 1))
+        time.sleep(1.5 * (a + 1))
     return None
 
 
