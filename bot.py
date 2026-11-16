@@ -16,6 +16,7 @@ except ImportError:
     pass
 
 import aiosqlite
+from aiohttp import ClientSession, web
 import fitz  # PyMuPDF
 from bs4 import BeautifulSoup, NavigableString
 from deep_translator import GoogleTranslator
@@ -38,7 +39,7 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder
 
 # ══════════════════════════ الإعدادات ══════════════════════════
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMINS = {8233150959}
+ADMINS = {8233150959} | {int(x) for x in re.findall(r"\d+", os.getenv("ADMIN_IDS", ""))}  # المالك + أي مدير من Render
 DB_PATH = os.getenv("DB_PATH", "bot.db")
 TMP = Path(os.getenv("TMP_DIR", "tmp")); TMP.mkdir(exist_ok=True)
 MAX_JOBS = int(os.getenv("MAX_JOBS", "3"))          # كتب تُترجم بالتوازي
@@ -170,13 +171,31 @@ CTRL = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 TR_SEM = None
 
 
+class TranslateError(Exception):
+    pass
+
+
+def _gtx(text, lang):
+    import requests
+    r = requests.post("https://translate.googleapis.com/translate_a/single",
+                      params={"client": "gtx", "sl": "auto", "tl": lang, "dt": "t"},
+                      data={"q": text}, timeout=25, headers={"User-Agent": "Mozilla/5.0"})
+    r.raise_for_status()
+    return "".join(p[0] for p in r.json()[0] if p and p[0])
+
+
 def _call(text, lang):
-    for a in range(4):
+    for a in range(3):
         try:
             r = GoogleTranslator(source="auto", target=lang).translate(text)
             if r: return r
         except Exception as e:
-            log.warning("translate retry %s: %s", a, e)
+            log.warning("deep-translator failed (try %s): %s", a, e)
+        try:
+            r = _gtx(text, lang)
+            if r: return r
+        except Exception as e:
+            log.warning("gtx fallback failed (try %s): %s", a, e)
         time.sleep(1.2 * (a + 1))
     return None
 
@@ -250,6 +269,8 @@ async def translate_units(units, lang, idxs, progress=None):
 
     await asyncio.gather(*(work(g) for g in groups))
     if new: await db.many("INSERT OR REPLACE INTO cache VALUES(?,?)", list(new.items()))
+    if todo and (len(todo) - len(new)) / len(todo) > 0.3:
+        raise TranslateError("translation backend failed")
     merged = {**cached, **new}
     return {i: merged.get(keys[i], units[i]) for i in idxs}
 
@@ -590,6 +611,8 @@ async def process(bot, uid, orig_name, path, partial=False):
             await incr("total_chars", total); await incr("total_files")
             try: await status.delete()
             except Exception: pass
+    except TranslateError:
+        await status.edit_text("❌ خدمة الترجمة لا تستجيب حالياً. لم يُخصم من رصيدك شيء، حاول بعد قليل.")
     except ValueError:
         await status.edit_text("❌ لم أجد نصاً قابلاً للاستخراج (قد يكون الملف صوراً ممسوحة ضوئياً).")
     except RuntimeError:
@@ -815,7 +838,10 @@ async def on_text(m: Message, bot: Bot, user):
     if not is_premium(u) and total > rem:
         return await m.answer(offer_text(total, rem), reply_markup=kb(plans_rows([[("👥 احصل على رصيد بدعوة صديق", "ref")]])))
     await bot.send_chat_action(m.chat.id, "typing")
-    res = await translate_units(lines, u["lang"], idxs)
+    try:
+        res = await translate_units(lines, u["lang"], idxs)
+    except TranslateError:
+        return await m.answer("❌ خدمة الترجمة لا تستجيب حالياً. لم يُخصم من رصيدك شيء، حاول بعد قليل.")
     out = "\n".join(res.get(i, l) if i in res else l for i, l in enumerate(lines))
     if not is_premium(u): await consume(u["id"], total)
     await incr("total_chars", total)
@@ -842,6 +868,23 @@ BACK = kb([[("🔙 رجوع", "adm:home")]])
 @adm.message(Command("admin"))
 async def cmd_admin(m: Message, state: FSMContext):
     await state.clear(); await m.answer(ADMIN_HOME, reply_markup=admin_kb())
+
+
+@adm.message(Command("diag"))
+async def cmd_diag(m: Message):
+    """تشخيص الترجمة: يعرض النتيجة أو الخطأ الحقيقي مباشرة في تيليجرام."""
+    out = []
+    probes = (("deep-translator", lambda: GoogleTranslator(source="auto", target="ar").translate("Hello, how are you today?")),
+              ("gtx", lambda: _gtx("Hello, how are you today?", "ar")))
+    for name, fn in probes:
+        try:
+            r = await asyncio.to_thread(fn)
+            out.append(f"✅ {name}: {html.escape(str(r))}")
+        except Exception as e:
+            out.append(f"❌ {name}: {html.escape(repr(e)[:300])}")
+    u = await get_user(m.from_user.id)
+    out.append(f"🌐 لغتك الحالية: {u['lang']}")
+    await m.answer("\n".join(out))
 
 
 async def stats_text():
@@ -987,7 +1030,8 @@ async def adm_channel_add(m: Message, state: FSMContext, bot: Bot):
     await db.run("INSERT OR REPLACE INTO channels VALUES(?,?,?)", (chat.id, chat.title or str(chat.id), link))
     SUB_OK.clear(); await state.clear()
     await m.answer(f"✅ تمت إضافة <b>{html.escape(chat.title or '')}</b> كقناة اشتراك إجباري.")
-    await m.answer(*await channels_view()) if False else await m.answer((await channels_view())[0], reply_markup=(await channels_view())[1])
+    text, mk = await channels_view()
+    await m.answer(text, reply_markup=mk)
 
 
 # إعدادات
@@ -1057,6 +1101,27 @@ async def cleanup_loop():
             if not p.exists(): PENDING.pop(uid, None)
 
 
+async def start_web():
+    """منفذ صغير لخطة Render المجانية (Web Service) + ping ذاتي حتى لا تنام الخدمة."""
+    port = os.getenv("PORT")
+    if not port: return
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    log.info("Web server on port %s", port)
+
+
+async def keep_alive():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url: return
+    async with ClientSession() as s:
+        while True:
+            await asyncio.sleep(480)
+            try: await s.get(url, timeout=20)
+            except Exception: pass
+
+
 async def main():
     global BOT_USERNAME, BOT_ID
     if not BOT_TOKEN: raise SystemExit("ضع BOT_TOKEN في ملف .env")
@@ -1076,6 +1141,8 @@ async def main():
                                BotCommand(command="me", description="حسابي"), BotCommand(command="redeem", description="تفعيل كود"),
                                BotCommand(command="help", description="المساعدة")])
     asyncio.create_task(cleanup_loop())
+    await start_web()
+    asyncio.create_task(keep_alive())
     log.info("Bot @%s started", BOT_USERNAME)
     while True:
         try:
