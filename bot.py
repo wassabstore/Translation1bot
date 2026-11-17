@@ -3,7 +3,7 @@
 📚 بوت ترجمة الكتب — Telegram (aiogram 3)
 الصيغ: PDF, EPUB, DOCX, TXT, MD, SRT, VTT, HTML, FB2 (+ MOBI/AZW3/RTF/ODT/DOC عبر calibre إن وُجد)
 """
-import asyncio, hashlib, html, logging, os, re, secrets, shutil, subprocess, time
+import asyncio, hashlib, html, logging, os, re, secrets, shutil, sqlite3, subprocess, time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import date, datetime
@@ -29,7 +29,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramRetryAfter
-from aiogram.filters import BaseFilter, Command, CommandStart
+from aiogram.filters import BaseFilter, Command, CommandObject, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -645,7 +645,7 @@ adm.message.filter(IsAdmin()); adm.callback_query.filter(IsAdmin())
 
 
 class US(StatesGroup): redeem = State()
-class AS(StatesGroup): bc = State(); user = State(); channel = State(); setval = State()
+class AS(StatesGroup): bc = State(); user = State(); channel = State(); setval = State(); delcode = State()
 
 
 # ─────────── المستخدم ───────────
@@ -856,10 +856,9 @@ async def fallback(m: Message):
 # ─────────── الإدارة ───────────
 def admin_kb():
     return kb([[("📊 الإحصائيات", "adm:stats"), ("📢 إذاعة", "adm:bc")],
-               [("📋 قائمة المستخدمين", "adm:ul:all:0")],
                [("👤 إدارة مستخدم", "adm:user"), ("📌 الاشتراك الإجباري", "adm:ch")],
                [("🎟 أكواد الاشتراك", "adm:codes"), ("⚙️ الإعدادات", "adm:set")],
-               [("🗂 نسخة احتياطية", "adm:backup")]])
+               [("👥 قائمة المستخدمين", "adm:ul:all:0"), ("🗂 نسخة احتياطية", "adm:backup")]])
 
 
 ADMIN_HOME = "🛠 <b>لوحة الإدارة</b>"
@@ -886,6 +885,82 @@ async def cmd_diag(m: Message):
     u = await get_user(m.from_user.id)
     out.append(f"🌐 لغتك الحالية: {u['lang']}")
     await m.answer("\n".join(out))
+
+
+@adm.message(F.document, F.caption == "/restore")
+async def cmd_restore(m: Message, bot: Bot):
+    """استرجاع النسخة الاحتياطية: أرسل ملف .db مع التعليق /restore"""
+    path = TMP / "restore.db"
+    try:
+        await bot.download(m.document, destination=path, timeout=120)
+        c = sqlite3.connect(str(path))
+        n = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM codes").fetchone(); c.close()
+    except Exception:
+        return await m.answer("❌ الملف غير صالح. أرسل ملف النسخة الاحتياطية الصحيح.")
+    await db.c.close()
+    for suf in ("-wal", "-shm"): Path(DB_PATH + suf).unlink(missing_ok=True)
+    shutil.copy(path, DB_PATH); path.unlink(missing_ok=True)
+    await db.init()
+    for k, v in DEFAULTS.items(): S[k] = v
+    for r in await db.all("SELECT k,v FROM settings"): S[r["k"]] = r["v"]
+    SUB_OK.clear()
+    await m.answer(f"✅ تم الاسترجاع بنجاح: {n:,} مستخدم.")
+
+
+async def unused_view():
+    rows = await db.all("SELECT code,days FROM codes WHERE used_by IS NULL ORDER BY created DESC LIMIT 15")
+    text = "📋 <b>الأكواد غير المستخدمة</b> (آخر 15)\nاضغط على كود لإلغائه 🗑" if rows else "لا توجد أكواد غير مستخدمة."
+    return text, kb([[(f"🗑 {r['code']} • {r['days']}ي", f"adm:cdel:{r['code']}")] for r in rows] + [[("🔙 رجوع", "adm:codes")]])
+
+
+async def delete_code(code):
+    code = code.strip().upper()
+    row = await db.one("SELECT * FROM codes WHERE code=?", (code,))
+    if not row: return "❌ الكود غير موجود.", None
+    if row["used_by"]:
+        return (f"⚠️ الكود مستخدم من <code>{row['used_by']}</code> بتاريخ {fmt_date(row['used_at'])}، ولا يمكن حذفه.\n"
+                f"يمكنك إلغاء اشتراك صاحبه من بطاقته:"), kb([[("👤 فتح بطاقة المستخدم", f"u:card:{row['used_by']}")]])
+    await db.run("DELETE FROM codes WHERE code=?", (code,))
+    return f"🗑 تم إلغاء الكود <code>{code}</code> ولن يعمل بعد الآن.", None
+
+
+@adm.message(Command("cancel"))
+async def adm_cancel(m: Message, state: FSMContext):
+    await state.clear(); await m.answer("تم الإلغاء ✅")
+
+
+@adm.message(AS.delcode, F.text)
+async def adm_delcode(m: Message, state: FSMContext):
+    await state.clear()
+    text, mk = await delete_code(m.text)
+    await m.answer(text, reply_markup=mk)
+
+
+@adm.message(Command("delcode"))
+async def cmd_delcode(m: Message, command: CommandObject):
+    if not command.args: return await m.answer("الاستخدام: /delcode BK-XXXX-XXXX-XXXX")
+    text, mk = await delete_code(command.args)
+    await m.answer(text, reply_markup=mk)
+
+
+@adm.message(Command("ban", "unban", "unsub"))
+async def cmd_quick(m: Message, command: CommandObject):
+    """أوامر سريعة: /ban ID  /unban ID  /unsub ID  (أو @username)"""
+    arg = (command.args or "").strip()
+    u = None
+    if arg.isdigit(): u = await get_user(int(arg))
+    elif arg: u = await db.one("SELECT * FROM users WHERE LOWER(username)=?", (arg.lstrip("@").lower(),))
+    if not u: return await m.answer(f"الاستخدام: /{command.command} ID أو @username")
+    c = command.command
+    if c == "ban":
+        if u["id"] in ADMINS: return await m.answer("لا يمكن حظر مدير.")
+        await db.run("UPDATE users SET banned=1 WHERE id=?", (u["id"],)); msg = "🚫 تم حظر"
+    elif c == "unban":
+        await db.run("UPDATE users SET banned=0 WHERE id=?", (u["id"],)); msg = "✅ تم فك حظر"
+    else:
+        await db.run("UPDATE users SET premium_until=0 WHERE id=?", (u["id"],)); msg = "❌ تم إلغاء اشتراك"
+    await m.answer(f"{msg} <code>{u['id']}</code>")
 
 
 async def stats_text():
@@ -920,35 +995,25 @@ async def settings_view():
     return "⚙️ <b>الإعدادات</b> — اضغط لتعديل قيمة:", kb(rows)
 
 
-# قائمة المستخدمين (صفحات + فلاتر)
-UL_PER = 8
-UL_FILTERS = {"all": "الكل", "prem": "💎 المشتركون", "free": "🆓 المجانيون", "ban": "🚫 المحظورون"}
-
-
-async def users_view(flt, page):
+async def users_view(flt, page, per=8):
     now = int(time.time())
-    cond = {"all": "1", "prem": f"premium_until>{now}", "free": f"premium_until<={now} AND banned=0",
-            "ban": "banned=1"}.get(flt, "1")
-    if flt not in UL_FILTERS: flt = "all"
+    cond = {"all": "1", "prem": f"premium_until>{now}", "ban": "banned=1"}.get(flt, "1")
     total = (await db.one(f"SELECT COUNT(*) c FROM users WHERE {cond}"))["c"]
-    pages = max(1, -(-total // UL_PER))
+    pages = max(1, (total + per - 1) // per)
     page = min(max(page, 0), pages - 1)
-    rows = await db.all(f"SELECT id,name,username,banned,premium_until FROM users WHERE {cond} "
-                        f"ORDER BY joined DESC LIMIT {UL_PER} OFFSET {page * UL_PER}")
+    rows = await db.all(f"SELECT id,name,banned,premium_until FROM users WHERE {cond} ORDER BY last_seen DESC LIMIT ? OFFSET ?",
+                        (per, page * per))
     btns = []
     for r in rows:
         icon = "🚫" if r["banned"] else ("💎" if r["premium_until"] > now else "👤")
-        label = f"{icon} {(r['name'] or '-')[:18]}" + (f" @{r['username']}" if r["username"] else f" {r['id']}")
-        btns.append([(label, f"u:view:{r['id']}")])
+        btns.append([(f"{icon} {(r['name'] or '-')[:18]} • {r['id']}", f"u:card:{r['id']}")])
     nav = []
-    if page > 0: nav.append(("⬅️", f"adm:ul:{flt}:{page - 1}"))
-    nav.append((f"{page + 1}/{pages}", f"adm:ul:{flt}:{page}"))
-    if page < pages - 1: nav.append(("➡️", f"adm:ul:{flt}:{page + 1}"))
-    items = list(UL_FILTERS.items())
-    filt = [[(("• " if k == flt else "") + v, f"adm:ul:{k}:0") for k, v in items[:2]],
-            [(("• " if k == flt else "") + v, f"adm:ul:{k}:0") for k, v in items[2:]]]
-    text = f"📋 <b>المستخدمون</b> — {UL_FILTERS[flt]}: <b>{total:,}</b>\nاضغط على مستخدم لإدارته:"
-    return text, kb(filt + btns + [nav, [("🔙 رجوع", "adm:home")]])
+    if page > 0: nav.append(("◀️", f"adm:ul:{flt}:{page - 1}"))
+    nav.append((f"{page + 1}/{pages}", "adm:noop"))
+    if page < pages - 1: nav.append(("▶️", f"adm:ul:{flt}:{page + 1}"))
+    tabs = [(("• " if k == flt else "") + lbl, f"adm:ul:{k}:0") for k, lbl in (("all", "الكل"), ("prem", "💎 المشتركون"), ("ban", "🚫 المحظورون"))]
+    text = f"👥 <b>قائمة المستخدمين</b> — {total:,}\n👤 عادي  💎 مشترك  🚫 محظور\nاضغط على مستخدم لإدارته:"
+    return text, kb([tabs] + btns + [nav, [("🔙 رجوع", "adm:home")]])
 
 
 @adm.callback_query(F.data.startswith("adm:"))
@@ -957,8 +1022,6 @@ async def adm_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
     await state.clear(); await cb.answer()
     if a == "home": await edit(cb, ADMIN_HOME, admin_kb())
     elif a == "stats": await edit(cb, await stats_text(), kb([[("🔄 تحديث", "adm:stats")], [("🔙 رجوع", "adm:home")]]))
-    elif a == "ul":
-        await edit(cb, *await users_view(p[2], int(p[3])))
     elif a == "bc":
         await state.set_state(AS.bc)
         await edit(cb, "📢 أرسل الآن الرسالة التي تريد إذاعتها (نص / صورة / فيديو / ملف ...)\nللإلغاء: /cancel", BACK)
@@ -974,7 +1037,7 @@ async def adm_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
         await edit(cb, *await channels_view())
     elif a == "codes":
         await edit(cb, "🎟 <b>أكواد الاشتراك</b>", kb([[("➕ كود شهري (30 يوم)", "adm:gen:30"), ("➕ كود سنوي (365 يوم)", "adm:gen:365")],
-                                                       [("📋 الأكواد غير المستخدمة", "adm:unused")], [("🔙 رجوع", "adm:home")]]))
+                                                       [("📋 غير المستخدمة", "adm:unused"), ("🗑 إلغاء كود", "adm:delcode")], [("🔙 رجوع", "adm:home")]]))
     elif a == "gen":
         days = int(p[2])
         if len(p) == 3:
@@ -987,18 +1050,29 @@ async def adm_cb(cb: CallbackQuery, state: FSMContext, bot: Bot):
             await db.many("INSERT INTO codes(code,days,created) VALUES(?,?,?)", [(c, days, int(time.time())) for c in codes])
             await edit(cb, f"✅ تم إنشاء {n} كود ({days} يوم):\n\n" + "\n".join(f"<code>{c}</code>" for c in codes),
                        kb([[("🔙 رجوع", "adm:codes")]]))
-    elif a == "unused":
-        rows = await db.all("SELECT code,days FROM codes WHERE used_by IS NULL ORDER BY created DESC LIMIT 40")
-        await edit(cb, "📋 <b>غير مستخدمة (آخر 40)</b>\n\n" + ("\n".join(f"<code>{r['code']}</code> — {r['days']}ي" for r in rows) or "لا يوجد."),
-                   kb([[("🔙 رجوع", "adm:codes")]]))
+    elif a == "unused": await edit(cb, *await unused_view())
+    elif a == "cdel":
+        await db.run("DELETE FROM codes WHERE code=? AND used_by IS NULL", (p[2],))
+        await edit(cb, *await unused_view())
+    elif a == "delcode":
+        await state.set_state(AS.delcode)
+        await edit(cb, "🗑 أرسل الكود الذي تريد إلغاءه:\nللإلغاء: /cancel", BACK)
     elif a == "set":
         if len(p) == 2: await edit(cb, *await settings_view())
         else:
             await state.set_state(AS.setval); await state.update_data(key=p[2])
             await edit(cb, f"أرسل القيمة الجديدة لـ <b>{SET_LABELS[p[2]]}</b>\n(القيمة الحالية: {S.get(p[2]) or '—'})\nللحذف أرسل: -", BACK)
+    elif a == "ul": await edit(cb, *await users_view(p[2], int(p[3])))
+    elif a == "noop": pass
     elif a == "backup":
         await db.c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-        await bot.send_document(cb.from_user.id, FSInputFile(DB_PATH, filename=f"backup_{today()}.db"))
+        tmp = TMP / "backup.db"; shutil.copy(DB_PATH, tmp)
+
+        def slim():  # نحذف الكاش لتصغير الملف
+            c = sqlite3.connect(str(tmp)); c.execute("DELETE FROM cache"); c.commit(); c.execute("VACUUM"); c.close()
+        await asyncio.to_thread(slim)
+        await bot.send_document(cb.from_user.id, FSInputFile(tmp, filename=f"backup_{today()}.db"),
+                                caption="🗂 نسخة احتياطية.\nللاسترجاع: أرسل هذا الملف للبوت وفي التعليق اكتب <code>/restore</code>")
 
 
 # حظر / إدارة مستخدم
@@ -1011,9 +1085,8 @@ async def user_card(uid):
             f"📊 المتبقي اليوم: {remaining(u):,}\n📅 انضم: {fmt_date(u['joined'])}")
     rows = [[("✅ فك الحظر", f"u:unban:{uid}") if u["banned"] else ("🚫 حظر", f"u:ban:{uid}")],
             [("🎁 +30 يوم", f"u:gift:{uid}:30"), ("🎁 +365 يوم", f"u:gift:{uid}:365")],
-            [("♻️ تصفير الاستهلاك", f"u:reset:{uid}")],
-            [("🔙 قائمة المستخدمين", "adm:ul:all:0")]]
-    if is_premium(u): rows.insert(2, [("❌ إلغاء الاشتراك المميز", f"u:rm:{uid}")])
+            [("❌ إلغاء الاشتراك", f"u:rm:{uid}"), ("♻️ تصفير الاستهلاك", f"u:reset:{uid}")],
+            [("👥 قائمة المستخدمين", "adm:ul:all:0"), ("🔙 رجوع", "adm:home")]]
     return text, kb(rows)
 
 
@@ -1030,8 +1103,7 @@ async def adm_user_lookup(m: Message, state: FSMContext):
 async def adm_user_action(cb: CallbackQuery, bot: Bot):
     p = cb.data.split(":"); a, uid = p[1], int(p[2])
     if a == "ban" and uid in ADMINS: return await cb.answer("لا يمكن حظر مدير", show_alert=True)
-    if a == "view": pass
-    elif a == "ban": await db.run("UPDATE users SET banned=1 WHERE id=?", (uid,))
+    if a == "ban": await db.run("UPDATE users SET banned=1 WHERE id=?", (uid,))
     elif a == "unban": await db.run("UPDATE users SET banned=0 WHERE id=?", (uid,))
     elif a == "gift":
         until = await add_premium(uid, int(p[3]))
@@ -1040,10 +1112,8 @@ async def adm_user_action(cb: CallbackQuery, bot: Bot):
         asyncio.create_task(resume_pending(bot, uid))
     elif a == "rm": await db.run("UPDATE users SET premium_until=0 WHERE id=?", (uid,))
     elif a == "reset": await db.run("UPDATE users SET used_today=0 WHERE id=?", (uid,))
-    await cb.answer() if a == "view" else await cb.answer("✅ تم")
-    text, mk = await user_card(uid)
-    if not text: return await edit(cb, "❌ مستخدم غير موجود.", kb([[("🔙 قائمة المستخدمين", "adm:ul:all:0")]]))
-    await edit(cb, text, mk)
+    await cb.answer("✅ تم" if a != "card" else None)
+    text, mk = await user_card(uid); await edit(cb, text, mk)
 
 
 # قنوات
