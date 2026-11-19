@@ -1169,4 +1169,186 @@ async def user_card(uid):
     u = await get_user(uid)
     if not u: return None, None
     sub = f"حتى {fmt_date(u['premium_until'])}" if is_premium(u) else "لا"
-    text = (f"👤 <b>{html.escape(u['name'] or '-')}</b> @{u['user
+    text = (f"👤 <b>{html.escape(u['name'] or '-')}</b> @{u['username'] or '-'}\n🆔 <code>{u['id']}</code>\n"
+            f"🚫 محظور: {'نعم' if u['banned'] else 'لا'}\n💎 اشتراك: {sub}\n📚 ملفات: {u['files']}\n"
+            f"📊 المتبقي اليوم: {remaining(u):,}\n📅 انضم: {fmt_date(u['joined'])}")
+    rows = [[("✅ فك الحظر", f"u:unban:{uid}") if u["banned"] else ("🚫 حظر", f"u:ban:{uid}")],
+            [("🎁 +30 يوم", f"u:gift:{uid}:30"), ("🎁 +365 يوم", f"u:gift:{uid}:365")],
+            [("❌ إلغاء الاشتراك", f"u:rm:{uid}"), ("♻️ تصفير الاستهلاك", f"u:reset:{uid}")],
+            [("👥 قائمة المستخدمين", "adm:ul:all:0"), ("🔙 رجوع", "adm:home")]]
+    return text, kb(rows)
+
+
+@adm.message(AS.user, F.text)
+async def adm_user_lookup(m: Message, state: FSMContext):
+    t = m.text.strip()
+    u = await get_user(int(t)) if t.isdigit() else await db.one("SELECT id FROM users WHERE LOWER(username)=?", (t.lstrip("@").lower(),))
+    if not u: return await m.answer("❌ مستخدم غير موجود. جرّب مجدداً أو /cancel")
+    await state.clear()
+    text, mk = await user_card(u["id"]); await m.answer(text, reply_markup=mk)
+
+
+@adm.callback_query(F.data.startswith("u:"))
+async def adm_user_action(cb: CallbackQuery, bot: Bot):
+    p = cb.data.split(":"); a, uid = p[1], int(p[2])
+    if a == "ban" and uid in ADMINS: return await cb.answer("لا يمكن حظر مدير", show_alert=True)
+    if a == "ban": await db.run("UPDATE users SET banned=1 WHERE id=?", (uid,))
+    elif a == "unban": await db.run("UPDATE users SET banned=0 WHERE id=?", (uid,))
+    elif a == "gift":
+        until = await add_premium(uid, int(p[3]))
+        try: await bot.send_message(uid, f"🎁 تم منحك اشتراكاً مجانياً حتى <b>{fmt_date(until)}</b> 💎")
+        except Exception: pass
+        asyncio.create_task(resume_pending(bot, uid))
+    elif a == "rm": await db.run("UPDATE users SET premium_until=0 WHERE id=?", (uid,))
+    elif a == "reset": await db.run("UPDATE users SET used_today=0 WHERE id=?", (uid,))
+    await cb.answer("✅ تم" if a != "card" else None)
+    text, mk = await user_card(uid); await edit(cb, text, mk)
+
+
+# قنوات
+@adm.message(AS.channel)
+async def adm_channel_add(m: Message, state: FSMContext, bot: Bot):
+    try:
+        if m.forward_origin and getattr(m.forward_origin, "chat", None):
+            chat = await bot.get_chat(m.forward_origin.chat.id)
+        else:
+            t = (m.text or "").strip()
+            chat = await bot.get_chat(int(t) if re.fullmatch(r"-?\d+", t) else ("@" + t.split("/")[-1].lstrip("@")))
+        me_ = await bot.get_chat_member(chat.id, BOT_ID)
+        if me_.status not in ("administrator", "creator"): raise PermissionError
+    except PermissionError:
+        return await m.answer("❌ البوت ليس مشرفاً في هذه القناة. ارفعه مشرفاً ثم أعد المحاولة.")
+    except Exception:
+        return await m.answer("❌ تعذّر العثور على القناة. تأكد من المعرف وأن البوت مشرف فيها.")
+    link = f"https://t.me/{chat.username}" if chat.username else chat.invite_link
+    if not link:
+        try: link = await bot.export_chat_invite_link(chat.id)
+        except Exception: return await m.answer("❌ تعذّر الحصول على رابط القناة (امنح البوت صلاحية دعوة المستخدمين).")
+    await db.run("INSERT OR REPLACE INTO channels VALUES(?,?,?)", (chat.id, chat.title or str(chat.id), link))
+    SUB_OK.clear(); await state.clear()
+    await m.answer(f"✅ تمت إضافة <b>{html.escape(chat.title or '')}</b> كقناة اشتراك إجباري.")
+    text, mk = await channels_view()
+    await m.answer(text, reply_markup=mk)
+
+
+# إعدادات
+@adm.message(AS.setval, F.text)
+async def adm_set_value(m: Message, state: FSMContext):
+    key = (await state.get_data())["key"]; v = m.text.strip()
+    if key == "contact": v = "" if v == "-" else v
+    elif not v.isdigit(): return await m.answer("❌ أرسل رقماً صحيحاً.")
+    await set_setting(key, v); await state.clear()
+    text, mk = await settings_view(); await m.answer("✅ تم الحفظ")
+    await m.answer(text, reply_markup=mk)
+
+
+# إذاعة
+@adm.message(AS.bc)
+async def adm_bc_msg(m: Message, state: FSMContext):
+    if m.text and m.text.startswith("/"): return
+    await state.update_data(src_chat=m.chat.id, src_msg=m.message_id)
+    now = int(time.time())
+    c = lambda w: db.one(f"SELECT COUNT(*) c FROM users WHERE active=1 AND banned=0 AND {w}")
+    a_, p_, f_ = [(await c(w))["c"] for w in ("1", f"premium_until>{now}", f"premium_until<={now}")]
+    await m.answer("👆 هذه معاينة الرسالة. لمن تريد إرسالها؟",
+                   reply_markup=kb([[(f"👥 الكل ({a_:,})", "bc:all")], [(f"💎 المشتركون ({p_:,})", "bc:prem"), (f"🆓 المجانيون ({f_:,})", "bc:free")],
+                                    [("❌ إلغاء", "bc:cancel")]]))
+
+
+@adm.callback_query(F.data.startswith("bc:"))
+async def adm_bc_go(cb: CallbackQuery, state: FSMContext, bot: Bot):
+    mode = cb.data.split(":")[1]; d = await state.get_data(); await state.clear(); await cb.answer()
+    if mode == "cancel" or "src_msg" not in d: return await edit(cb, "تم الإلغاء.", admin_kb())
+    await edit(cb, "🚀 بدأت الإذاعة في الخلفية، سيصلك تقرير عند الانتهاء.")
+    asyncio.create_task(do_broadcast(bot, cb.from_user.id, d["src_chat"], d["src_msg"], mode))
+
+
+async def do_broadcast(bot, admin_id, src_chat, src_msg, mode):
+    now = int(time.time())
+    cond = {"all": "1", "prem": f"premium_until>{now}", "free": f"premium_until<={now}"}[mode]
+    ids = [r["id"] for r in await db.all(f"SELECT id FROM users WHERE active=1 AND banned=0 AND {cond}")]
+    st = await bot.send_message(admin_id, f"📢 جارٍ الإرسال إلى {len(ids):,} مستخدم...")
+    ok = fail = 0
+    for n, uid in enumerate(ids, 1):
+        for _ in range(3):
+            try:
+                await bot.copy_message(uid, src_chat, src_msg); ok += 1; break
+            except TelegramRetryAfter as e: await asyncio.sleep(e.retry_after + 1)
+            except (TelegramForbiddenError, TelegramBadRequest):
+                fail += 1; await db.run("UPDATE users SET active=0 WHERE id=?", (uid,)); break
+            except Exception: fail += 1; break
+        else: fail += 1
+        await asyncio.sleep(0.05)
+        if n % 200 == 0:
+            try: await st.edit_text(f"📢 {n:,}/{len(ids):,}\n{bar(int(n * 100 / len(ids)))}")
+            except Exception: pass
+    await bot.send_message(admin_id, f"✅ <b>انتهت الإذاعة</b>\n\n✔️ نجح: {ok:,}\n✖️ فشل/حاظر: {fail:,}")
+
+
+# ══════════════════════════ التشغيل ══════════════════════════
+async def cleanup_loop():
+    while True:
+        await asyncio.sleep(600)
+        now = time.time()
+        for f in TMP.iterdir():
+            try:
+                if now - f.stat().st_mtime > 7200: f.unlink()
+            except Exception: pass
+        for uid, (p, _) in list(PENDING.items()):
+            if not p.exists(): PENDING.pop(uid, None)
+
+
+async def start_web():
+    """منفذ صغير لخطة Render المجانية (Web Service) + ping ذاتي حتى لا تنام الخدمة."""
+    port = os.getenv("PORT")
+    if not port: return
+    app = web.Application()
+    app.router.add_get("/", lambda r: web.Response(text="OK"))
+    runner = web.AppRunner(app); await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", int(port)).start()
+    log.info("Web server on port %s", port)
+
+
+async def keep_alive():
+    url = os.getenv("RENDER_EXTERNAL_URL")
+    if not url: return
+    async with ClientSession() as s:
+        while True:
+            await asyncio.sleep(480)
+            try: await s.get(url, timeout=20)
+            except Exception: pass
+
+
+async def main():
+    global BOT_USERNAME, BOT_ID
+    if not BOT_TOKEN: raise SystemExit("ضع BOT_TOKEN في ملف .env")
+    await db.init()
+    for k, v in DEFAULTS.items(): S[k] = v
+    for r in await db.all("SELECT k,v FROM settings"): S[r["k"]] = r["v"]
+    bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+    me_ = await bot.get_me(); BOT_USERNAME, BOT_ID = me_.username, me_.id
+    dp = Dispatcher(storage=MemoryStorage())
+    dp.message.outer_middleware(Gate()); dp.callback_query.outer_middleware(Gate())
+    dp.include_router(adm); dp.include_router(router)
+
+    @dp.error()
+    async def on_error(ev: ErrorEvent): log.error("Unhandled: %s", ev.exception, exc_info=ev.exception)
+
+    await bot.set_my_commands([BotCommand(command="start", description="البداية"), BotCommand(command="lang", description="لغة الترجمة"),
+                               BotCommand(command="me", description="حسابي"), BotCommand(command="redeem", description="تفعيل كود"),
+                               BotCommand(command="help", description="المساعدة")])
+    asyncio.create_task(cleanup_loop())
+    await start_web()
+    asyncio.create_task(keep_alive())
+    log.info("Bot @%s started", BOT_USERNAME)
+    while True:
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+            break  # إيقاف نظيف (SIGTERM عند النشر) فلا نعيد التشغيل
+        except Exception:
+            log.exception("polling crashed, restarting in 5s"); await asyncio.sleep(5)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
