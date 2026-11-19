@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import date, datetime
 from pathlib import Path
 
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
