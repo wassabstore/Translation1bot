@@ -249,7 +249,28 @@ def _lingva(text, lang):
     raise RuntimeError(f"lingva: {last}")
 
 
-PROV = {"deepl": _deepl, "gcloud": _gcloud, "claude": _claude, "gtx": _gtx, "deep": _deep, "lingva": _lingva}
+_EDGE = {"tok": "", "exp": 0}
+
+
+def _edge(text, lang):
+    """مترجم Microsoft Edge المجاني (غير رسمي، بلا مفتاح) — مستقل عن Google."""
+    import requests
+    ua = {"User-Agent": "Mozilla/5.0"}
+    if time.time() > _EDGE["exp"]:
+        r = requests.get("https://edge.microsoft.com/translate/auth", headers=ua, timeout=15)
+        r.raise_for_status()
+        _EDGE["tok"], _EDGE["exp"] = r.text.strip(), time.time() + 480
+    tl = {"zh-CN": "zh-Hans", "iw": "he"}.get(lang, lang)
+    r = requests.post("https://api-edge.cognitive.microsofttranslator.com/translate",
+                      params={"to": tl, "api-version": "3.0", "includeSentenceLength": "true"},
+                      headers={**ua, "Authorization": "Bearer " + _EDGE["tok"], "Content-Type": "application/json"},
+                      json=[{"Text": text}], timeout=30)
+    if r.status_code in (401, 403): _EDGE["exp"] = 0
+    r.raise_for_status()
+    return r.json()[0]["translations"][0]["text"]
+
+
+PROV = {"edge": _edge, "deepl": _deepl, "gcloud": _gcloud, "claude": _claude, "gtx": _gtx, "deep": _deep, "lingva": _lingva}
 PROV_BAD: dict = {}
 
 
@@ -258,7 +279,7 @@ def _providers():
     if os.getenv("DEEPL_API_KEY"): names.append("deepl")
     if os.getenv("GOOGLE_API_KEY"): names.append("gcloud")
     if os.getenv("ANTHROPIC_API_KEY"): names.append("claude")
-    return names + ["gtx", "deep", "lingva"]
+    return names + ["edge", "gtx", "deep", "lingva"]
 
 
 def _call(text, lang):
