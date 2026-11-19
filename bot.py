@@ -249,6 +249,29 @@ def _lingva(text, lang):
     raise RuntimeError(f"lingva: {last}")
 
 
+def _mymemory(text, lang):
+    """MyMemory: API مجاني رسمي (5000 حرف/يوم، 50000 مع MYMEMORY_EMAIL). حد الطلب 500 حرف فنقسّم السطور."""
+    import requests
+    tl = {"iw": "he"}.get(lang, lang)
+    email = os.getenv("MYMEMORY_EMAIL", "")
+    out = []
+    for line in text.split("\n"):
+        if not line.strip():
+            out.append(line); continue
+        res = []
+        for part in split_long(line, 450):
+            params = {"q": part, "langpair": f"Autodetect|{tl}"}
+            if email: params["de"] = email
+            r = requests.get("https://api.mymemory.translated.net/get", params=params, timeout=25)
+            r.raise_for_status()
+            j = r.json()
+            if str(j.get("responseStatus")) != "200":
+                raise RuntimeError("mymemory: " + str(j.get("responseDetails") or j.get("responseData"))[:150])
+            res.append(j["responseData"]["translatedText"])
+        out.append(" ".join(res))
+    return "\n".join(out)
+
+
 _EDGE = {"tok": "", "exp": 0}
 
 
@@ -270,7 +293,7 @@ def _edge(text, lang):
     return r.json()[0]["translations"][0]["text"]
 
 
-PROV = {"edge": _edge, "deepl": _deepl, "gcloud": _gcloud, "claude": _claude, "gtx": _gtx, "deep": _deep, "lingva": _lingva}
+PROV = {"mymemory": _mymemory, "edge": _edge, "deepl": _deepl, "gcloud": _gcloud, "claude": _claude, "gtx": _gtx, "deep": _deep, "lingva": _lingva}
 PROV_BAD: dict = {}
 
 
@@ -279,7 +302,7 @@ def _providers():
     if os.getenv("DEEPL_API_KEY"): names.append("deepl")
     if os.getenv("GOOGLE_API_KEY"): names.append("gcloud")
     if os.getenv("ANTHROPIC_API_KEY"): names.append("claude")
-    return names + ["edge", "gtx", "deep", "lingva"]
+    return names + ["gtx", "deep", "lingva", "mymemory"]
 
 
 def _call(text, lang):
