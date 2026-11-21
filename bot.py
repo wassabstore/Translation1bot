@@ -290,21 +290,45 @@ def _sys(lang):
             f"Output only the translation.")
 
 
-def _gemini(text, lang):
-    """Gemini API (مجاني بمفتاح من Google AI Studio). يجرّب عدة نماذج إذا كان أحدها مزدحماً."""
+_GM = {"models": [], "exp": 0}
+
+
+def _gemini_models(key):
+    """يسأل Google عن النماذج المتاحة لمفتاحك فعلاً (أو يستعمل GEMINI_MODEL إن حددته)."""
+    custom = os.getenv("GEMINI_MODEL", "").strip()
+    if custom: return [m.strip() for m in custom.split(",") if m.strip()]
+    if _GM["models"] and time.time() < _GM["exp"]: return _GM["models"]
     import requests
+    r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", params={"pageSize": 200},
+                     headers={"x-goog-api-key": key}, timeout=20)
+    r.raise_for_status()
+    bad = ("embedding", "image", "tts", "live", "audio", "robotics", "computer", "vision", "aqa", "learnlm", "gemma", "imagen", "veo")
+    names = []
+    for m in r.json().get("models", []):
+        n = m.get("name", "").split("/", 1)[-1]
+        if n.startswith("gemini") and "generateContent" in m.get("supportedGenerationMethods", []) and not any(x in n for x in bad):
+            names.append(n)
+    names.sort(key=lambda n: (("preview" in n or "exp" in n), "pro" in n, "lite" in n, n))
+    if not names: raise RuntimeError("gemini: no models available for this key")
+    _GM["models"], _GM["exp"] = names[:4], time.time() + 3600
+    return _GM["models"]
+
+
+def _gemini(text, lang):
+    """Gemini API (مجاني بمفتاح من Google AI Studio). يجرّب عدة نماذج إذا كان أحدها مزدحماً أو غير متاح."""
+    import requests
+    key = os.getenv("GEMINI_API_KEY", "")
     _throttle("gemini", float(os.getenv("GEMINI_INTERVAL", "5")))
-    models = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
     cats = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
     body = {"systemInstruction": {"parts": [{"text": _sys(lang)}]},
             "contents": [{"role": "user", "parts": [{"text": text}]}],
             "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
             "safetySettings": [{"category": c, "threshold": "BLOCK_NONE"} for c in cats]}
     last = "no model"
-    for model in models:
+    for model in _gemini_models(key):
         r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                          headers={"x-goog-api-key": os.getenv("GEMINI_API_KEY", "")}, json=body, timeout=120)
-        if r.status_code in (404, 429, 500, 503):  # نموذج مزدحم/غير متاح → التالي
+                          headers={"x-goog-api-key": key}, json=body, timeout=120)
+        if r.status_code in (404, 429, 500, 503):
             last = f"{model} {r.status_code}: {r.text[:120]}"
             continue
         if r.status_code != 200:
@@ -317,6 +341,7 @@ def _gemini(text, lang):
         out = "".join(p.get("text", "") for p in parts).strip()
         if out: return out
         last = f"{model}: empty"
+    _GM["exp"] = 0  # أعد اكتشاف النماذج في المرة القادمة
     raise RuntimeError("gemini: " + last)
 
 
@@ -1073,6 +1098,9 @@ async def cmd_diag(m: Message):
             out.append(f"✅ {name}: {html.escape(str(r))}")
         except Exception as e:
             out.append(f"❌ {name}: {html.escape(repr(e)[:300])}")
+    if os.getenv("GEMINI_API_KEY"):
+        try: out.append("🤖 نماذج Gemini المتاحة: " + ", ".join(await asyncio.to_thread(_gemini_models, os.getenv("GEMINI_API_KEY"))))
+        except Exception as e: out.append("🤖 تعذّر جلب نماذج Gemini: " + html.escape(repr(e)[:200]))
     u = await get_user(m.from_user.id)
     out.append(f"🌐 لغتك الحالية: {u['lang']}")
     await m.answer("\n".join(out))
