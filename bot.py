@@ -3,7 +3,7 @@
 📚 بوت ترجمة الكتب — Telegram (aiogram 3)
 الصيغ: PDF, EPUB, DOCX, TXT, MD, SRT, VTT, HTML, FB2 (+ MOBI/AZW3/RTF/ODT/DOC عبر calibre إن وُجد)
 """
-import asyncio, hashlib, html, logging, os, re, secrets, shutil, sqlite3, subprocess, time
+import asyncio, hashlib, html, logging, os, re, secrets, shutil, sqlite3, subprocess, threading, time
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from datetime import date, datetime
@@ -272,6 +272,60 @@ def _mymemory(text, lang):
     return "\n".join(out)
 
 
+_TLOCK, _TLAST = {}, {}
+
+
+def _throttle(name, interval):
+    """يفصل بين طلبات المحرك الواحد لاحترام حدود الطبقة المجانية."""
+    lock = _TLOCK.setdefault(name, threading.Lock())
+    with lock:
+        wait = _TLAST.get(name, 0) + interval - time.time()
+        if wait > 0: time.sleep(wait)
+        _TLAST[name] = time.time()
+
+
+def _sys(lang):
+    return (f"You are a professional book translator. Translate the user's text into {_lname(lang)} (language code {lang}). "
+            f"Keep exactly the same number of lines and the same order. Do not add notes, quotes, numbering or explanations. "
+            f"Output only the translation.")
+
+
+def _gemini(text, lang):
+    """Gemini API (مجاني عبر Google AI Studio بمفتاح بلا بطاقة)."""
+    import requests
+    _throttle("gemini", float(os.getenv("GEMINI_INTERVAL", "5")))
+    model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    cats = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
+    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                      headers={"x-goog-api-key": os.getenv("GEMINI_API_KEY", "")}, timeout=120,
+                      json={"systemInstruction": {"parts": [{"text": _sys(lang)}]},
+                            "contents": [{"role": "user", "parts": [{"text": text}]}],
+                            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+                            "safetySettings": [{"category": c, "threshold": "BLOCK_NONE"} for c in cats]})
+    if r.status_code != 200:
+        raise RuntimeError(f"gemini {r.status_code}: {r.text[:160]}")
+    parts = r.json()["candidates"][0]["content"]["parts"]
+    out = "".join(p.get("text", "") for p in parts).strip()
+    if not out: raise RuntimeError("gemini: empty")
+    return out
+
+
+def _llm(text, lang):
+    """أي خدمة متوافقة مع OpenAI (Groq / OpenRouter ...) عبر LLM_BASE_URL و LLM_API_KEY و LLM_MODEL."""
+    import requests
+    _throttle("llm", float(os.getenv("LLM_INTERVAL", "2")))
+    base = os.getenv("LLM_BASE_URL", "").rstrip("/")
+    r = requests.post(base + "/chat/completions", timeout=120,
+                      headers={"Authorization": "Bearer " + os.getenv("LLM_API_KEY", "")},
+                      json={"model": os.getenv("LLM_MODEL", ""), "temperature": 0.2,
+                            "messages": [{"role": "system", "content": _sys(lang)}, {"role": "user", "content": text}]})
+    if r.status_code != 200:
+        raise RuntimeError(f"llm {r.status_code}: {r.text[:160]}")
+    out = (r.json()["choices"][0]["message"]["content"] or "").strip()
+    if not out: raise RuntimeError("llm: empty")
+    return out
+
+
 _EDGE = {"tok": "", "exp": 0}
 
 
@@ -293,15 +347,21 @@ def _edge(text, lang):
     return r.json()[0]["translations"][0]["text"]
 
 
-PROV = {"mymemory": _mymemory, "edge": _edge, "deepl": _deepl, "gcloud": _gcloud, "claude": _claude, "gtx": _gtx, "deep": _deep, "lingva": _lingva}
+PROV = {"gemini": _gemini, "llm": _llm, "mymemory": _mymemory, "edge": _edge, "deepl": _deepl, "gcloud": _gcloud, "claude": _claude, "gtx": _gtx, "deep": _deep, "lingva": _lingva}
 PROV_BAD: dict = {}
 
 
 def _providers():
+    order = os.getenv("TRANSLATE_ORDER", "")  # مثال: gemini,gtx
+    if order:
+        names = [n.strip() for n in order.split(",") if n.strip() in PROV]
+        if names: return names
     names = []
     if os.getenv("DEEPL_API_KEY"): names.append("deepl")
     if os.getenv("GOOGLE_API_KEY"): names.append("gcloud")
     if os.getenv("ANTHROPIC_API_KEY"): names.append("claude")
+    if os.getenv("GEMINI_API_KEY"): names.append("gemini")
+    if os.getenv("LLM_API_KEY") and os.getenv("LLM_BASE_URL") and os.getenv("LLM_MODEL"): names.append("llm")
     return names + ["gtx", "deep", "lingva", "mymemory"]
 
 
@@ -1247,7 +1307,6 @@ async def adm_user_action(cb: CallbackQuery, bot: Bot):
     elif a == "reset": await db.run("UPDATE users SET used_today=0 WHERE id=?", (uid,))
     await cb.answer("✅ تم" if a != "card" else None)
     text, mk = await user_card(uid); await edit(cb, text, mk)
-
 
 
 # قنوات
