@@ -291,23 +291,33 @@ def _sys(lang):
 
 
 def _gemini(text, lang):
-    """Gemini API (مجاني عبر Google AI Studio بمفتاح بلا بطاقة)."""
+    """Gemini API (مجاني بمفتاح من Google AI Studio). يجرّب عدة نماذج إذا كان أحدها مزدحماً."""
     import requests
     _throttle("gemini", float(os.getenv("GEMINI_INTERVAL", "5")))
-    model = os.getenv("GEMINI_MODEL", "gemini-flash-latest")
+    models = [m.strip() for m in os.getenv("GEMINI_MODEL", "gemini-flash-latest,gemini-2.5-flash,gemini-2.5-flash-lite").split(",") if m.strip()]
     cats = ("HARM_CATEGORY_HARASSMENT", "HARM_CATEGORY_HATE_SPEECH", "HARM_CATEGORY_SEXUALLY_EXPLICIT", "HARM_CATEGORY_DANGEROUS_CONTENT")
-    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                      headers={"x-goog-api-key": os.getenv("GEMINI_API_KEY", "")}, timeout=120,
-                      json={"systemInstruction": {"parts": [{"text": _sys(lang)}]},
-                            "contents": [{"role": "user", "parts": [{"text": text}]}],
-                            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
-                            "safetySettings": [{"category": c, "threshold": "BLOCK_NONE"} for c in cats]})
-    if r.status_code != 200:
-        raise RuntimeError(f"gemini {r.status_code}: {r.text[:160]}")
-    parts = r.json()["candidates"][0]["content"]["parts"]
-    out = "".join(p.get("text", "") for p in parts).strip()
-    if not out: raise RuntimeError("gemini: empty")
-    return out
+    body = {"systemInstruction": {"parts": [{"text": _sys(lang)}]},
+            "contents": [{"role": "user", "parts": [{"text": text}]}],
+            "generationConfig": {"temperature": 0.2, "maxOutputTokens": 8192},
+            "safetySettings": [{"category": c, "threshold": "BLOCK_NONE"} for c in cats]}
+    last = "no model"
+    for model in models:
+        r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                          headers={"x-goog-api-key": os.getenv("GEMINI_API_KEY", "")}, json=body, timeout=120)
+        if r.status_code in (404, 429, 500, 503):  # نموذج مزدحم/غير متاح → التالي
+            last = f"{model} {r.status_code}: {r.text[:120]}"
+            continue
+        if r.status_code != 200:
+            raise RuntimeError(f"gemini {model} {r.status_code}: {r.text[:160]}")
+        try:
+            parts = r.json()["candidates"][0]["content"]["parts"]
+        except Exception:
+            last = f"{model}: blocked/empty"
+            continue
+        out = "".join(p.get("text", "") for p in parts).strip()
+        if out: return out
+        last = f"{model}: empty"
+    raise RuntimeError("gemini: " + last)
 
 
 def _llm(text, lang):
