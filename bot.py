@@ -302,7 +302,7 @@ def _gemini_models(key):
     r = requests.get("https://generativelanguage.googleapis.com/v1beta/models", params={"pageSize": 200},
                      headers={"x-goog-api-key": key}, timeout=20)
     r.raise_for_status()
-    bad = ("embedding", "image", "tts", "live", "audio", "robotics", "computer", "vision", "aqa", "learnlm", "gemma", "imagen", "veo")
+    bad = ("embedding", "embed", "image", "tts", "live", "audio", "transcribe", "speech", "robotics", "computer", "vision", "aqa", "learnlm", "gemma", "imagen", "veo")
     names = []
     for m in r.json().get("models", []):
         n = m.get("name", "").split("/", 1)[-1]
@@ -331,8 +331,11 @@ def _gemini(text, lang):
         if r.status_code in (404, 429, 500, 503):
             last = f"{model} {r.status_code}: {r.text[:120]}"
             continue
-        if r.status_code != 200:
-            raise RuntimeError(f"gemini {model} {r.status_code}: {r.text[:160]}")
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"gemini {r.status_code}: {r.text[:160]}")
+        if r.status_code != 200:  # مثل 400: نموذج لا يناسب هذا الطلب → جرّب التالي
+            last = f"{model} {r.status_code}: {r.text[:120]}"
+            continue
         try:
             parts = r.json()["candidates"][0]["content"]["parts"]
         except Exception:
